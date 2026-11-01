@@ -1,0 +1,182 @@
+#!/usr/bin/env python3
+"""
+Redrix Perceptual Auto-Brightness Daemon (fallback for active session before GNOME Shell reload).
+If the GNOME Shell extension 'redrix-auto-brightness@local' is already ACTIVE (state 1),
+this daemon exits cleanly so the in-shell extension handles everything natively.
+"""
+import glob
+import math
+import os
+import subprocess
+import time
+
+GAMMA = 2.2
+MIN_HW = 960
+MAX_HW = 96000
+SPAN_HW = MAX_HW - MIN_HW
+
+
+def is_extension_active():
+    try:
+        out = subprocess.check_output([
+            "gdbus", "call", "--session",
+            "--dest", "org.gnome.Shell",
+            "--object-path", "/org/gnome/Shell",
+            "--method", "org.gnome.Shell.Extensions.GetExtensionInfo",
+            "redrix-auto-brightness@local"
+        ], text=True, stderr=subprocess.DEVNULL, timeout=3)
+        return "'state': <1.0>" in out or "'state': <1>" in out or "'state': <uint32 1>" in out
+    except Exception:
+        return False
+
+
+def find_als_input():
+    for p in sorted(glob.glob("/sys/bus/iio/devices/iio:device*")):
+        try:
+            name = open(os.path.join(p, "name")).read().strip()
+            inp = os.path.join(p, "in_illuminance_input")
+            if name == "cros-ec-light" and os.path.exists(inp):
+                return inp
+        except Exception:
+            pass
+    fallback = "/sys/bus/iio/devices/iio:device0/in_illuminance_input"
+    return fallback if os.path.exists(fallback) else None
+
+
+def calc_auto_perceptual(lux):
+    # Logarithmic curve: 0 lux -> 17%, 9 lux -> 43%, 30 lux -> 57%, 100 lux -> 71%, 300 lux -> 84%, 1000+ lux -> 100%
+    base = 0.15 + 0.28 * math.log10(max(0.0, lux) + 1.2)
+    return max(0.12, min(1.0, base))
+
+
+def perceptual_to_hw(p):
+    p = max(0.0, min(1.0, p))
+    return int(round(MIN_HW + SPAN_HW * (p ** GAMMA)))
+
+
+def hw_to_perceptual(hw):
+    lin = max(0.0, min(1.0, (hw - MIN_HW) / float(SPAN_HW)))
+    return lin ** (1.0 / GAMMA)
+
+
+def read_hw():
+    return int(open("/sys/class/backlight/intel_backlight/brightness").read().strip())
+
+
+def write_hw(hw_val):
+    hw_val = max(MIN_HW, min(MAX_HW, int(round(hw_val))))
+    try:
+        with open("/sys/class/backlight/intel_backlight/brightness", "w") as f:
+            f.write(f"{hw_val}\n")
+    except PermissionError:
+        subprocess.run([
+            "gdbus", "call", "--system",
+            "--dest", "org.freedesktop.login1",
+            "--object-path", "/org/freedesktop/login1/session/auto",
+            "--method", "org.freedesktop.login1.Session.SetBrightness",
+            "backlight", "intel_backlight", str(hw_val)
+        ], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+
+def sync_mutter_backlight(hw_val):
+    try:
+        out = subprocess.check_output([
+            "gdbus", "call", "--session",
+            "--dest", "org.gnome.Mutter.DisplayConfig",
+            "--object-path", "/org/gnome/Mutter/DisplayConfig",
+            "--method", "org.freedesktop.DBus.Properties.Get",
+            "org.gnome.Mutter.DisplayConfig", "Backlight"
+        ], text=True, timeout=2)
+        # Extract serial: (<(uint32 16, ...
+        if "uint32 " in out:
+            serial = out.split("uint32 ")[1].split(",")[0].strip()
+            subprocess.run([
+                "gdbus", "call", "--session",
+                "--dest", "org.gnome.Mutter.DisplayConfig",
+                "--object-path", "/org/gnome/Mutter/DisplayConfig",
+                "--method", "org.gnome.Mutter.DisplayConfig.SetBacklight",
+                serial, "eDP-1", str(hw_val)
+            ], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=2)
+    except Exception:
+        pass
+
+
+def main():
+    if is_extension_active():
+        print("GNOME Shell extension redrix-auto-brightness@local is ACTIVE; exiting fallback daemon.")
+        return
+
+    # Disable gsd-power ambient-enabled so it doesn't fight us
+    subprocess.run([
+        "gsettings", "set", "org.gnome.settings-daemon.plugins.power", "ambient-enabled", "false"
+    ], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    subprocess.run([
+        "gdbus", "call", "--session",
+        "--dest", "org.gnome.Shell.Brightness",
+        "--object-path", "/org/gnome/Shell/Brightness",
+        "--method", "org.gnome.Shell.Brightness.SetAutoBrightnessTarget",
+        "--", "-1.0"
+    ], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+    als_path = find_als_input()
+    if not als_path:
+        print("No cros-ec-light sensor found.")
+        return
+
+    smoothed_lux = None
+    user_bias = 0.0
+    current_p = hw_to_perceptual(read_hw())
+    target_p = current_p
+    last_written_hw = read_hw()
+    last_poll = 0.0
+
+    while True:
+        now = time.monotonic()
+
+        # Check if user manually changed brightness via slider or hotkeys
+        actual_hw = read_hw()
+        if abs(actual_hw - last_written_hw) > 150:
+            current_p = hw_to_perceptual(actual_hw)
+            target_p = current_p
+            last_written_hw = actual_hw
+            if smoothed_lux is not None:
+                user_bias = max(-0.5, min(0.5, current_p - calc_auto_perceptual(smoothed_lux)))
+
+        # Poll ALS every 1.0s
+        if now - last_poll >= 1.0:
+            last_poll = now
+            try:
+                raw_lux = float(open(als_path).read().strip())
+                if smoothed_lux is None:
+                    smoothed_lux = raw_lux
+                    new_target = max(0.05, min(1.0, calc_auto_perceptual(smoothed_lux) + user_bias))
+                    target_p = new_target
+                else:
+                    diff = abs(raw_lux - smoothed_lux)
+                    rel_diff = diff / max(1.0, smoothed_lux)
+                    alpha = 0.45 if (diff >= 4.0 and rel_diff >= 0.35) else 0.20
+                    smoothed_lux = smoothed_lux * (1.0 - alpha) + raw_lux * alpha
+                    new_target = max(0.05, min(1.0, calc_auto_perceptual(smoothed_lux) + user_bias))
+                    if abs(new_target - target_p) >= 0.015:
+                        target_p = new_target
+            except Exception:
+                pass
+
+        # Smooth animation step (every 50ms)
+        delta = target_p - current_p
+        if abs(delta) > 0.0015:
+            step = math.copysign(min(0.005, max(0.001, abs(delta) * 0.15)), delta)
+            current_p += step
+            hw = perceptual_to_hw(current_p)
+            if hw != last_written_hw:
+                write_hw(hw)
+                last_written_hw = hw
+                if abs(target_p - current_p) <= 0.006:
+                    sync_mutter_backlight(hw)
+            time.sleep(0.05)
+        else:
+            time.sleep(0.2)
+
+
+if __name__ == "__main__":
+    main()

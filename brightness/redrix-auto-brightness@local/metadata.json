@@ -1,0 +1,7 @@
+{
+  "uuid": "redrix-auto-brightness@local",
+  "name": "Redrix Perceptual Auto Brightness",
+  "description": "Perceptual Gamma 2.2 backlight curve and smooth logarithmic ambient light auto-brightness for HP Elite Dragonfly Chromebook (Redrix)",
+  "shell-version": ["50", "49", "48"],
+  "version": 1
+}

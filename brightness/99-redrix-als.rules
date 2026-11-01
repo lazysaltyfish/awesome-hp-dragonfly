@@ -1,0 +1,4 @@
+# Ensure ChromeOS EC Ambient Light Sensor (OPT3001 on Redrix) has active sampling and EC rate
+ACTION=="add|change", SUBSYSTEM=="iio", ATTR{name}=="cros-ec-light", ATTR{sampling_frequency}="1.000000", ATTR{buffer/hwfifo_timeout}="1.000000"
+# Allow smooth high-frequency user-space perceptual backlight transitions
+ACTION=="add|change", SUBSYSTEM=="backlight", KERNEL=="intel_backlight", RUN+="/bin/chmod 0666 /sys/class/backlight/intel_backlight/brightness"
