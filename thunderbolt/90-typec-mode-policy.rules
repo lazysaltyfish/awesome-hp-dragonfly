@@ -1,0 +1,11 @@
+# Type-C alt mode policy: prefer TBT3, fall back to DP (see typec-mode-policy)
+
+# Port altmodes: keep DP from being auto-entered, allow TBT
+ACTION=="add", SUBSYSTEM=="typec", KERNEL=="port[0-9].[0-9]*", ATTR{svid}=="ff01", ATTR{active}="no"
+ACTION=="add", SUBSYSTEM=="typec", KERNEL=="port[0-9].[0-9]*", ATTR{svid}=="8087", ATTR{active}="yes"
+
+# Partner altmode appeared -> decide which mode to enter
+ACTION=="add", SUBSYSTEM=="typec", KERNEL=="port[0-9]-partner.[0-9]*", RUN+="/usr/bin/systemd-run --no-block --collect /usr/local/libexec/typec-mode-policy %k"
+
+# Partner removed -> disable port DP again so the next device starts clean
+ACTION=="remove", SUBSYSTEM=="typec", KERNEL=="port[0-9]-partner", PROGRAM="/bin/sh -c 'echo %k | cut -d- -f1'", RUN+="/usr/local/libexec/typec-mode-policy reset %c"

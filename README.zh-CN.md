@@ -1,7 +1,7 @@
 <div align="center">
 
 # HP Elite Dragonfly Chromebook (`redrix`) Linux 完整修复手册
-### 充电限流 · 音频麦克风 · IPU6 摄像头调校 · 自动亮度感知曲线
+### 充电限流 · 音频麦克风 · IPU6 摄像头调校 · 自动亮度感知曲线 · 雷电 3 扩展坞
 
 **[🇬🇧 English / Bilingual Overview (README.md)](./README.md) · [🤖 AI Agent 工作流 (AGENTS.md)](./AGENTS.md)**
 
@@ -19,11 +19,11 @@
 | **音频环境** | SOF 固件 `2.2.0` + PipeWire `1.6.10` + WirePlumber `0.5.18` + `alsa-ucm` `1.2.16` + GNOME `50.6` |
 | **摄像头环境** | `libcamera` `0.7.2-2.fc44` + `pipewire-plugin-libcamera` + Google Chrome `156` Flatpak |
 | **自动亮度环境** | `gnome-shell` `50.6` + `gnome-settings-daemon` `50.1` + `iio-sensor-proxy` `3.8` + `cros-ec-light` (`TI OPT3001`) |
-| **实证日期** | 2026-10-27（问题一/二/三）、2026-11-01（问题四），全程在本机实证完成 |
+| **实证日期** | 2026-10-27（问题一/二/三）、2026-11-01（问题四）、2026-11-07（问题五，Fedora 45 / Kernel `7.2.15`），全程在本机实证完成 |
 
 ---
 
-## 总览（四个问题，各自独立）
+## 总览（五个问题，各自独立）
 
 | # | 症状 | 根因 | 修复（一行版） |
 | :-: | :--- | :--- | :--- |
@@ -31,6 +31,7 @@
 | **[二](#问题二audio-fix-后-gnome-看不到麦克风或默认麦录不到音)** | GNOME 看不到麦克风 / 默认麦是哑的 | 显示层缓存 + 默认选中 DC 死通道 `Mic2` | `./audio/install.sh`（配置 SOF DMIC + 切换默认输入到 `Mic1`） |
 | **[三](#问题三flatpak-chrome-摄像头不可用与画面偏绿)** | Chrome 摄像头不可用；打通后偏绿 | flag 未开 + portal 弹窗 bug + 无原厂色彩调校 | `./camera/install.sh` + 开启 Chrome PipeWire camera flag |
 | **[四](#问题四自动屏幕亮度怪异与滑块拉满)** | 自动亮度变化不线性、暗光下过亮且滑块拉满 | `gsd-power` 相对归一化缺陷 + GNOME 50 滑块固定偏移 + 线性 PWM 未做 `γ = 2.2` 校正 + `EC_RATE=0` | `./brightness/install.sh`（udev + 对数曲线 + `γ = 2.2` 扩展/服务） |
+| **[五](#问题五雷电-3-扩展坞无法识别)** | 雷电 3 扩展坞只充电，硬盘、DP、USB 都不出现 | 内核自动进入 DP 模式，扩展坞拒绝后卡住，再也不接受 TBT；`cros_ec_typec` 的 TBT 模式默认未启用，又没有 `typecd` 去开启 | `./thunderbolt/install.sh`（udev 策略：优先 TBT3，没有再用 DP） |
 
 > **给 AI Agent 的提示**：如果你是负责在新系统上恢复配置或排查问题的 Agent，请优先阅读同目录下的 **[`AGENTS.md`](./AGENTS.md)** 获取结构化的幂等执行与验证工作流。
 
@@ -465,3 +466,46 @@ watch -n 0.2 'cat /sys/bus/iio/devices/iio:device0/in_illuminance_input /sys/cla
 ```
 
 如需调整整体亮度曲线偏亮/偏暗，修改 `brightness/redrix-auto-brightness` 与 `brightness/redrix-auto-brightness@local/extension.js` 中的 `0.15 + 0.28 * log10(lux + 1.2)` 常数项（如把 `0.15` 改为 `0.20` 即可全局提亮 `5%` 感知亮度），然后重新运行 `./brightness/install.sh`。
+
+---
+
+<a id="问题五雷电-3-扩展坞无法识别"></a>
+
+## 问题五：雷电 3 扩展坞无法识别（Type-C 备用模式策略）
+
+### TL;DR
+- **现象**：雷电 3 扩展坞（实测：ACASIS 雷电 3 NVMe 扩展坞，Intel JHL7440 Titan Ridge DD，PD ID `042b:185e`）插上后只以 20V/3A 给电脑充电。`boltctl list` 为空，`/sys/bus/thunderbolt/devices/` 里只有本机的两个主机控制器，扩展坞上的 NVMe 和 DP 都不出现。换左右口、换扩展坞上的接口都没有用。
+- **根因**（三层）：
+  1. `redrix` 的 EC 带有 `EC_FEATURE_TYPEC_REQUIRE_AP_MODE_ENTRY`（`inventory` 第 42 位）：EC 不会自己进入任何备用模式，必须由主机下令。ChromeOS 上由 `typecd` 守护进程负责（先 TBT/USB4，再 DP）。
+  2. `cros_ec_typec` 注册 TBT 端口模式（`8087`）时故意设成 `desc.inactive = true`（对应 ChromeOS 的"外设数据访问"开关），DP 端口模式（`ff01`）却是开着的。所以每次插入，`typec_displayport` 驱动都会立刻让 EC 进入 **DP** 模式。
+  3. 只支持雷电 3 的扩展坞接受了 DP 进入，却拒绝 DP 配置（`NAK for cmd 17`、`DP alt mode protocol failed!`），然后卡在这个状态。之后的 TBT 进入请求被拒，EC 重试时发的 TBT 退出也被拒。EC 会无限循环 `TBT attempt to enter mode → exit mode SOP failed → alt mode protocol failed!`。内核日志里只能看到 `cros-ec-typec: No valid DP mode provided` / `Configure muxes failed, err = -22`。
+- **修复**：`./thunderbolt/install.sh` 安装一套 udev 策略，做 ChromeOS 上 `typecd` 做的事。它在端口层面关掉 DP 自动进入，打开 TBT 端口模式。有设备插入时，如果设备报了 SVID `8087`，就启用 TBT；否则重新打开 DP 并启用（USB-C 显示器照常可用）。设备拔出后，再把端口的 DP 关回去。
+
+### 部署的文件（`./thunderbolt/`）
+
+| 系统路径 | 仓库来源 | 作用 |
+| :--- | :--- | :--- |
+| `/etc/udev/rules.d/90-typec-mode-policy.rules` | `thunderbolt/90-typec-mode-policy.rules` | 端口模式注册时，把 `ff01` 设为 `active=no`、`8087` 设为 `active=yes`；设备的备用模式出现时，通过 `systemd-run` 调用策略脚本；设备拔出时执行复位。 |
+| `/usr/local/libexec/typec-mode-policy` | `thunderbolt/typec-mode-policy` | 等待 1.5 秒让 PD 发现流程完成，然后往设备 TBT 模式的 `active` 写 `yes`（`typec_thunderbolt` → `cros_typec_altmode_enter` → `EC_CMD_TYPEC_CONTROL` ENTER_MODE TBT）；设备没有 TBT 时改走 DP。日志用 `journalctl -t typec-mode-policy` 查看。 |
+
+### 验证结果
+```text
+$ sudo ectool usbpdmuxinfo
+Port 0: USB=0 DP=0 POLARITY=NORMAL HPD_IRQ=0 HPD_LVL=0 SAFE=0 TBT=1 USB4=0
+$ boltctl list
+ * Intel Tamales module 2   generation: Thunderbolt 3   status: authorized
+   rx/tx speed: 40 Gb/s = 2 lanes * 20 Gb/s            policy: iommu
+$ lspci -tv   →  JHL7440 Thunderbolt 3 USB Controller [Titan Ridge DD 2018] + MAXIO MAP1602 NVMe (4 TB)
+```
+重启和拔插后依然有效。实测环境：内核 `7.2.15-300.fc45`，EC RW `redrix_16238.2+tbt5`（MrChromebox）。
+
+### 诊断方法（用 `ectool` 读 EC 控制台）
+`./thunderbolt/build-ectool.sh` 会编译一个独立的 ChromiumOS `ectool`，输出到 `~/.cache/chromebook-fixes/ectool`。上游 `main` 需要 clang 和 platform2 的 `libec`，所以脚本固定使用最后一个纯 C 版本 `release-R105-14989.B-main`，用 gcc 编译，并去掉了 libusb 依赖。常用命令：
+```bash
+sudo ~/.cache/chromebook-fixes/ectool inventory          # 第 42 位 = 由主机控制进入模式
+sudo ~/.cache/chromebook-fixes/ectool typecdiscovery 0 0 # 设备身份与 SVID（8087 = TBT，ff01 = DP）
+sudo ~/.cache/chromebook-fixes/ectool typecdiscovery 0 1 # 线材 eMarker（TBT 速度需 >= Gen2）
+sudo ~/.cache/chromebook-fixes/ectool typecstatus 0      # EC 侧端口切换器：SAFE/USB/DP/TBT/USB4
+sudo ~/.cache/chromebook-fixes/ectool console            # PD 状态机日志（NAK、重试）
+```
+> 扩展坞已经卡在 DP 模式时，不要用 `ectool typeccontrol <port> 2 1` 强制进入 TBT，那会让 EC 进入无限重试循环。拔插一次，或者运行 `typeccontrol <port> 0`，就能停下来。

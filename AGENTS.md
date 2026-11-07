@@ -12,7 +12,7 @@ This repository contains verified hardware/desktop fixes and diagnostic tools fo
 
 ---
 
-## Workflow A: Idempotent Setup (Apply & Verify All 4 Fixes)
+## Workflow A: Idempotent Setup (Apply & Verify All Fixes)
 
 Run from the root of this repository (`cd <repo-root>`).
 
@@ -105,6 +105,26 @@ sudo dracut -f
 
 ---
 
+### Step 6: Fix Thunderbolt 3 Docks Not Detected (Type-C Alt Mode Policy: TBT3 > DP)
+
+- **Pre-check**:
+  ```bash
+  test -f /etc/udev/rules.d/90-typec-mode-policy.rules && echo "installed" || echo "missing"
+  for a in /sys/class/typec/port*/port*.[0-9]; do echo "$a svid=$(cat $a/svid) active=$(cat $a/active)"; done
+  ```
+- **Apply**:
+  ```bash
+  ./thunderbolt/install.sh
+  # Uninstall: ./thunderbolt/install.sh --uninstall
+  ```
+  Ask the user to **replug** the Thunderbolt dock afterwards (a device attached before install keeps its stale DP state).
+- **Verify**:
+  - Port altmodes: `ff01` (DP) is `active=no`, `8087` (TBT) is `active=yes` on every port (`/sys/class/typec/port*/port*.N`).
+  - With a TBT3 dock plugged in: `journalctl -t typec-mode-policy` shows `entered TBT3 alt mode`, `boltctl list` lists the dock as `authorized`, and `/sys/bus/thunderbolt/devices/` contains a `0-1`/`1-1` device.
+  - With a plain USB-C DP monitor (no `8087` SVID): the log shows `entered DP alt mode` and the monitor lights up.
+
+---
+
 ## Workflow B: Diagnostics & Porting to Other Chromebooks
 
 If any verification above fails or you are diagnosing a different Chromebook board, refer to the detailed sections in `README.md`:
@@ -115,6 +135,7 @@ If any verification above fails or you are diagnosing a different Chromebook boa
 | **Missing / Silent Mic** | Missing NHLT (`dmic_num=4` needed) + PipeWire splits 4ch DMIC into `Mic1` (live) and `Mic2` (dead DC) | `README.md` **问题二 (§A–§F)** |
 | **Camera Broken / Green** | IPU6 requires PipeWire camera flag + portal focus bug + missing `ov5675.yaml` BlackLevel/CCM | `README.md` **问题三 (§A–§F)** + `./camera/parse_aiqb.py` |
 | **Auto-Brightness Broken** | `gsd-power` relative normalization bug + GNOME 50 slider bias (`+0.5`) + linear PWM lacking $\gamma=2.2$ | `README.md` **问题四 (§A–§E)** |
+| **TBT3 Dock Not Detected** | Kernel `typec_displayport` auto-enters DP on attach (TBT3-only dock NAKs DP Configure, then NAKs TBT Enter/Exit); `cros_ec_typec` registers TBT port altmode `inactive` and nothing (no `typecd`) activates it | `README.md` **Issue 5 / 问题五** + `./thunderbolt/build-ectool.sh` (EC `console`) |
 
 ## Repository Layout
 
@@ -142,6 +163,12 @@ If any verification above fails or you are diagnosing a different Chromebook boa
 │   ├── ov5675.aiqb
 │   ├── parse_aiqb.py
 │   └── hw-isp-recon.md
+├── thunderbolt/                               # Issue 5: Type-C alt mode policy (TBT3 > DP) & EC tools
+│   ├── install.sh
+│   ├── 90-typec-mode-policy.rules
+│   ├── typec-mode-policy
+│   ├── build-ectool.sh
+│   └── comm-usb-stub.c
 └── tools/                                     # Issue 1: ChromeOS EC & battery diagnostic tools
     ├── ectool.py
     ├── batt_logger.sh

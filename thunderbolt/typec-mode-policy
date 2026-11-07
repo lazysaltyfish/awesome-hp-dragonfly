@@ -1,0 +1,50 @@
+#!/usr/bin/env bash
+# Type-C alt mode policy for HP Dragonfly Chromebook (redrix) on Fedora.
+# Mimics ChromeOS typecd: prefer TBT3, fall back to DP.
+#
+#   typec-mode-policy port0-partner.N   (called by udev when a partner altmode appears)
+#   typec-mode-policy reset port0       (called by udev when the partner goes away)
+#
+# Why: the kernel auto-enters DP alt mode when a partner appears, which leaves
+# TBT3-only docks (e.g. ACASIS / Titan Ridge) stuck and NAKing TBT entry.
+# udev keeps the port-level DP altmode disabled; this script then enters TBT if
+# the partner offers it, otherwise re-enables DP and enters it (USB-C monitors).
+T=/sys/class/typec
+log() { logger -t typec-mode-policy "$*"; }
+
+set_port_dp() { # $1=portN $2=yes/no
+	for a in "$T/$1/$1".*; do
+		[ "$(cat "$a/svid" 2>/dev/null)" = ff01 ] && echo "$2" >"$a/active"
+	done
+}
+
+if [ "$1" = reset ]; then
+	set_port_dp "$2" no
+	exit 0
+fi
+
+k="$1"
+port="${k%%-partner*}"
+P="$T/$port-partner"
+
+exec 9>"/run/typec-mode-policy-$port.lock"
+flock 9
+sleep 1.5 # let PD discovery finish and all partner altmodes register
+[ -d "$P" ] || exit 0
+
+tbt="" dp=""
+for a in "$P/$port-partner".*; do
+	case "$(cat "$a/svid" 2>/dev/null)" in
+	8087) tbt="$a" ;;
+	ff01) dp="$a" ;;
+	esac
+done
+
+if [ -n "$tbt" ]; then
+	[ "$(cat "$tbt/active")" = yes ] && exit 0
+	if echo yes >"$tbt/active"; then log "$port: entered TBT3 alt mode"; else log "$port: TBT3 entry failed"; fi
+elif [ -n "$dp" ]; then
+	[ "$(cat "$dp/active")" = yes ] && exit 0
+	set_port_dp "$port" yes
+	if echo yes >"$dp/active"; then log "$port: entered DP alt mode"; else log "$port: DP entry failed"; fi
+fi

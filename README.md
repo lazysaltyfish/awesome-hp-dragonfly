@@ -34,7 +34,7 @@ Complete root-cause proofs, hardware/firmware disassembly findings, and one-clic
 | **Camera Stack** | OV5675 (MIPI CSI) → Intel IPU6 (`8086:465d`) → `libcamera` `0.7.2` (SoftISP) → PipeWire → Chrome Flatpak |
 | **Backlight & ALS** | BOE 2678 eDP (`intel_backlight`, raw PWM `0–96000`) + TI OPT3001 (`cros-ec-light` / `iio:device0`) |
 
-### Executive Summary (4 Independent Issues)
+### Executive Summary (5 Independent Issues)
 
 | # | Symptom | Root Cause | One-Line Fix |
 | :-: | :--- | :--- | :--- |
@@ -42,6 +42,7 @@ Complete root-cause proofs, hardware/firmware disassembly findings, and one-clic
 | **[2](#issue-2-missing-or-silent-built-in-microphone)** | Speakers work after audio fix, but **microphone is missing in GNOME or records silence** | Missing NHLT (`dmic_num=4` required); PipeWire 1.6 splits 4-ch DMIC into `Mic1` (live) and `Mic2` (dead DC channel), and WirePlumber defaults to `Mic2` | `./audio/install.sh` (installs SOF/WirePlumber configs & sets `Mic1` as default) |
 | **[3](#issue-3-flatpak-chrome-camera-broken--green-tint)** | Camera **unavailable in Flatpak Chrome**; once enabled, image has a **heavy green tint** | Chrome PipeWire camera flag disabled + `xdg-desktop-portal-gnome` focus bug blocks prompt + `libcamera` falls back to `uncalibrated.yaml` | `./camera/install.sh` + enable `chrome://flags/#enable-webrtc-pipewire-camera` |
 | **[4](#issue-4-erratic-auto-brightness--non-linear-slider)** | Auto-brightness **jumps erratically, stays blindingly bright in dark rooms, and pins GNOME slider at 100%** | `gsd-power` relative normalization bug + GNOME 50 slider acts as a fixed `+48.6%` bias + linear PWM lacks `γ = 2.2` perceptual curve + `EC_RATE=0` | `./brightness/install.sh` (udev 1Hz + logarithmic lux curve + `γ = 2.2` GNOME extension/daemon) |
+| **[5](#issue-5-thunderbolt-3-dock-not-detected)** | Thunderbolt 3 dock **only charges the laptop**: no Thunderbolt device, no USB, no disk, no DP | Kernel `typec_displayport` auto-enters DP alt mode on attach → TBT3-only dock NAKs DP Configure and gets stuck, then NAKs TBT Enter/Exit; `cros_ec_typec` registers the TBT port altmode `inactive` and nothing on Fedora (no ChromeOS `typecd`) activates it | `./thunderbolt/install.sh` (udev alt mode policy: TBT3 preferred, DP fallback) |
 
 ### Quick Start (Apply All Fixes)
 
@@ -64,6 +65,9 @@ done
 
 # 4. Fix auto-brightness & perceptual Gamma 2.2 curve
 ./brightness/install.sh
+
+# 5. Fix Thunderbolt 3 docks (Type-C alt mode policy: TBT3 > DP), then replug the dock
+./thunderbolt/install.sh
 ```
 
 ---
@@ -280,6 +284,49 @@ EOF
 
 ---
 
+<a id="issue-5-thunderbolt-3-dock-not-detected"></a>
+
+### Issue 5: Thunderbolt 3 Dock Not Detected (Type-C Alt Mode Policy)
+
+#### TL;DR
+- **Symptom**: A Thunderbolt 3 dock (verified: ACASIS TBT3 NVMe dock, Intel JHL7440 Titan Ridge DD, PD ID `042b:185e`) only charges the laptop at 20V/3A. `boltctl list` is empty, `/sys/bus/thunderbolt/devices/` shows only the host routers, and neither the dock's NVMe nor its DP output appear. Changing port (left/right) or dock connector makes no difference.
+- **Root Cause** (three layers):
+  1. On `redrix`, the EC has `EC_FEATURE_TYPEC_REQUIRE_AP_MODE_ENTRY` (inventory bit 42): it never enters an alt mode by itself, so the AP has to ask for it. On ChromeOS, the `typecd` daemon does this (TBT/USB4 first, then DP).
+  2. `cros_ec_typec` registers the TBT port altmode (`8087`) with `desc.inactive = true` (by design, like ChromeOS's "peripheral data access" toggle), but the DP port altmode (`ff01`) is active. So on every attach, the `typec_displayport` driver immediately asks the EC to enter **DP** mode.
+  3. A TBT3-only dock ACKs DP Enter but NAKs DP Configure (`NAK for cmd 17`, `DP alt mode protocol failed!`) and is then stuck. A later TBT Enter request is NAKed, and so is the EC's TBT Exit retry. The EC loops `TBT attempt to enter mode → exit mode SOP failed → alt mode protocol failed!` forever. The kernel log only shows `cros-ec-typec: No valid DP mode provided` / `Configure muxes failed, err = -22`.
+- **Fix**: `./thunderbolt/install.sh` installs a udev policy that does what `typecd` does on ChromeOS. It disables DP auto-entry at port level and enables the TBT port altmode. When a partner appears, it activates TBT if the partner advertises SVID `8087`; otherwise it re-enables DP and activates that (USB-C monitors keep working). When the partner is removed, port DP is disabled again.
+
+#### Files Installed (`./thunderbolt/`)
+
+| Path | Source | Purpose |
+| :--- | :--- | :--- |
+| `/etc/udev/rules.d/90-typec-mode-policy.rules` | `thunderbolt/90-typec-mode-policy.rules` | Sets port altmode `ff01` `active=no` and `8087` `active=yes` when the port altmodes register; runs the policy script (via `systemd-run`) on partner altmode add, and a reset on partner remove. |
+| `/usr/local/libexec/typec-mode-policy` | `thunderbolt/typec-mode-policy` | Waits 1.5s for PD discovery, then writes `yes` to the partner's TBT altmode `active` (`typec_thunderbolt` → `cros_typec_altmode_enter` → `EC_CMD_TYPEC_CONTROL` ENTER_MODE TBT), or falls back to DP. Logs to `journalctl -t typec-mode-policy`. |
+
+#### Verified Result
+```text
+$ sudo ectool usbpdmuxinfo
+Port 0: USB=0 DP=0 POLARITY=NORMAL HPD_IRQ=0 HPD_LVL=0 SAFE=0 TBT=1 USB4=0
+$ boltctl list
+ * Intel Tamales module 2   generation: Thunderbolt 3   status: authorized
+   rx/tx speed: 40 Gb/s = 2 lanes * 20 Gb/s            policy: iommu
+$ lspci -tv   →  JHL7440 Thunderbolt 3 USB Controller [Titan Ridge DD 2018] + MAXIO MAP1602 NVMe (4 TB)
+```
+Survives reboot and replug. Tested on kernel `7.2.15-300.fc45`, EC RW `redrix_16238.2+tbt5` (MrChromebox).
+
+#### Diagnostic Methodology (EC console via `ectool`)
+`./thunderbolt/build-ectool.sh` builds a standalone ChromiumOS `ectool` into `~/.cache/chromebook-fixes/ectool`. Upstream `main` needs clang + platform2 `libec`, so the script pins `release-R105-14989.B-main`, the last pure-C version, builds it with plain gcc, and stubs out libusb. Useful commands:
+```bash
+sudo ~/.cache/chromebook-fixes/ectool inventory          # bit 42 = host-controlled mode entry
+sudo ~/.cache/chromebook-fixes/ectool typecdiscovery 0 0 # partner Identity + SVIDs (8087 = TBT, ff01 = DP)
+sudo ~/.cache/chromebook-fixes/ectool typecdiscovery 0 1 # cable eMarker (TBT speed must be >= Gen2)
+sudo ~/.cache/chromebook-fixes/ectool typecstatus 0      # EC-side mux: SAFE/USB/DP/TBT/USB4
+sudo ~/.cache/chromebook-fixes/ectool console            # PD state machine log (NAKs, retries)
+```
+> Do not use `ectool typeccontrol <port> 2 1` to force TBT on a dock that is already stuck in DP mode: it starts an endless EC retry loop. Replug, or run `typeccontrol <port> 0`, to stop it.
+
+---
+
 <a id="-中文完整文档"></a>
 
 ## 🇨🇳 中文完整文档
@@ -300,7 +347,7 @@ EOF
 | **摄像头栈** | OV5675（MIPI CSI）→ Intel IPU6（`8086:465d`）→ `libcamera` `0.7.2`（SoftISP）→ PipeWire → Chrome Flatpak |
 | **背光与光线传感器** | BOE 2678 eDP 面板（`intel_backlight`，线性 PWM `0–96000`）+ TI OPT3001（`cros-ec-light` / `iio:device0`） |
 
-### 总览（四个独立问题与一键修复）
+### 总览（五个独立问题与一键修复）
 
 | # | 症状 | 根因 | 修复（一行命令） |
 | :-: | :--- | :--- | :--- |
@@ -308,6 +355,7 @@ EOF
 | **[二](#问题二gnome-看不到麦克风或默认麦录不到音)** | 扬声器正常，但 **GNOME 看不到麦克风或默认麦是哑的** | 固件无 NHLT 表需强制 `dmic_num=4` + PipeWire 拆出死通道 `Mic2` 且被默认选中 | `./audio/install.sh`（部署 SOF/WirePlumber 配置并设 `Mic1` 为默认） |
 | **[三](#问题三flatpak-chrome-摄像头不可用与画面偏绿)** | Flatpak Chrome **摄像头不可用**；打通后**画面明显偏绿** | Chrome PipeWire camera flag 未开 + portal 焦点检查 bug + 缺原厂 `ov5675.yaml` 调校 | `./camera/install.sh` + 开启 `chrome://flags/#enable-webrtc-pipewire-camera` |
 | **[四](#问题四自动屏幕亮度怪异与滑块拉满)** | 自动亮度**变化不线性、暗光下依然刺眼且右上角滑块拉满** | `gsd-power` 相对归一化缺陷 + GNOME 50 滑块固定偏移 `+48.6%` + 线性 PWM 缺 `γ = 2.2` 校正 + `EC_RATE=0` | `./brightness/install.sh`（udev 1Hz + 对数曲线 + `γ = 2.2` 扩展/服务） |
+| **[五](#问题五雷电-3-扩展坞无法识别)** | 雷电 3 扩展坞**只给电脑充电**：没有 Thunderbolt 设备，硬盘、DP、USB 都不出现 | 内核 `typec_displayport` 在插入时自动进入 DP 模式 → 只支持雷电 3 的扩展坞拒绝 DP 配置并卡住，之后连 TBT 的进入和退出请求也一并拒绝；`cros_ec_typec` 把 TBT 端口模式注册为 `inactive`，Fedora 上没有 ChromeOS 的 `typecd` 去开启它 | `./thunderbolt/install.sh`（udev 模式策略：优先 TBT3，没有再用 DP） |
 
 ---
 
@@ -481,6 +529,47 @@ sudo cat /sys/kernel/debug/tracing/trace | grep tchg:
 
 > **手动微调记忆**：任何时候手动拖动 GNOME 亮度滑块或按键盘亮度键，系统会立即停止当前渐变并记录 `userBias = 用户设定感知亮度 - 当前照度基准感知亮度`（范围 `±50%`），后续环境光变化时自动在个人偏好偏移基础上平滑调节。
 
+<a id="问题五雷电-3-扩展坞无法识别"></a>
+
+### 问题五：雷电 3 扩展坞无法识别（Type-C 备用模式策略）
+
+#### TL;DR
+- **现象**：雷电 3 扩展坞（实测：ACASIS 雷电 3 NVMe 扩展坞，Intel JHL7440 Titan Ridge DD，PD ID `042b:185e`）插上后只以 20V/3A 给电脑充电。`boltctl list` 为空，`/sys/bus/thunderbolt/devices/` 里只有本机的两个主机控制器，扩展坞上的 NVMe 和 DP 都不出现。换左右口、换扩展坞上的接口都没有用。
+- **根因**（三层）：
+  1. `redrix` 的 EC 带有 `EC_FEATURE_TYPEC_REQUIRE_AP_MODE_ENTRY`（`inventory` 第 42 位）：EC 不会自己进入任何备用模式，必须由主机下令。ChromeOS 上由 `typecd` 守护进程负责（先 TBT/USB4，再 DP）。
+  2. `cros_ec_typec` 注册 TBT 端口模式（`8087`）时故意设成 `desc.inactive = true`（对应 ChromeOS 的"外设数据访问"开关），DP 端口模式（`ff01`）却是开着的。所以每次插入，`typec_displayport` 驱动都会立刻让 EC 进入 **DP** 模式。
+  3. 只支持雷电 3 的扩展坞接受了 DP 进入，却拒绝 DP 配置（`NAK for cmd 17`、`DP alt mode protocol failed!`），然后卡在这个状态。之后的 TBT 进入请求被拒，EC 重试时发的 TBT 退出也被拒。EC 会无限循环 `TBT attempt to enter mode → exit mode SOP failed → alt mode protocol failed!`。内核日志里只能看到 `cros-ec-typec: No valid DP mode provided` / `Configure muxes failed, err = -22`。
+- **修复**：`./thunderbolt/install.sh` 安装一套 udev 策略，做 ChromeOS 上 `typecd` 做的事。它在端口层面关掉 DP 自动进入，打开 TBT 端口模式。有设备插入时，如果设备报了 SVID `8087`，就启用 TBT；否则重新打开 DP 并启用（USB-C 显示器照常可用）。设备拔出后，再把端口的 DP 关回去。
+
+#### 部署的文件（`./thunderbolt/`）
+
+| 系统路径 | 仓库来源 | 作用 |
+| :--- | :--- | :--- |
+| `/etc/udev/rules.d/90-typec-mode-policy.rules` | `thunderbolt/90-typec-mode-policy.rules` | 端口模式注册时，把 `ff01` 设为 `active=no`、`8087` 设为 `active=yes`；设备的备用模式出现时，通过 `systemd-run` 调用策略脚本；设备拔出时执行复位。 |
+| `/usr/local/libexec/typec-mode-policy` | `thunderbolt/typec-mode-policy` | 等待 1.5 秒让 PD 发现流程完成，然后往设备 TBT 模式的 `active` 写 `yes`（`typec_thunderbolt` → `cros_typec_altmode_enter` → `EC_CMD_TYPEC_CONTROL` ENTER_MODE TBT）；设备没有 TBT 时改走 DP。日志用 `journalctl -t typec-mode-policy` 查看。 |
+
+#### 验证结果
+```text
+$ sudo ectool usbpdmuxinfo
+Port 0: USB=0 DP=0 POLARITY=NORMAL HPD_IRQ=0 HPD_LVL=0 SAFE=0 TBT=1 USB4=0
+$ boltctl list
+ * Intel Tamales module 2   generation: Thunderbolt 3   status: authorized
+   rx/tx speed: 40 Gb/s = 2 lanes * 20 Gb/s            policy: iommu
+$ lspci -tv   →  JHL7440 Thunderbolt 3 USB Controller [Titan Ridge DD 2018] + MAXIO MAP1602 NVMe (4 TB)
+```
+重启和拔插后依然有效。实测环境：内核 `7.2.15-300.fc45`，EC RW `redrix_16238.2+tbt5`（MrChromebox）。
+
+#### 诊断方法（用 `ectool` 读 EC 控制台）
+`./thunderbolt/build-ectool.sh` 会编译一个独立的 ChromiumOS `ectool`，输出到 `~/.cache/chromebook-fixes/ectool`。上游 `main` 需要 clang 和 platform2 的 `libec`，所以脚本固定使用最后一个纯 C 版本 `release-R105-14989.B-main`，用 gcc 编译，并去掉了 libusb 依赖。常用命令：
+```bash
+sudo ~/.cache/chromebook-fixes/ectool inventory          # 第 42 位 = 由主机控制进入模式
+sudo ~/.cache/chromebook-fixes/ectool typecdiscovery 0 0 # 设备身份与 SVID（8087 = TBT，ff01 = DP）
+sudo ~/.cache/chromebook-fixes/ectool typecdiscovery 0 1 # 线材 eMarker（TBT 速度需 >= Gen2）
+sudo ~/.cache/chromebook-fixes/ectool typecstatus 0      # EC 侧端口切换器：SAFE/USB/DP/TBT/USB4
+sudo ~/.cache/chromebook-fixes/ectool console            # PD 状态机日志（NAK、重试）
+```
+> 扩展坞已经卡在 DP 模式时，不要用 `ectool typeccontrol <port> 2 1` 强制进入 TBT，那会让 EC 进入无限重试循环。拔插一次，或者运行 `typeccontrol <port> 0`，就能停下来。
+
 ---
 
 ## Repository Structure / 仓库目录结构
@@ -510,6 +599,12 @@ awesome-hp-dragonfly/
 │   ├── ov5675.aiqb                            # Factory ChromeOS AIQB calibration binary
 │   ├── parse_aiqb.py                          # AIQB -> libcamera SoftISP YAML parser
 │   └── hw-isp-recon.md                        # Intel IPU6 hardware ISP (PSYS) feasibility study
+├── thunderbolt/                               # Issue 5: Type-C alt mode policy (TBT3 > DP) & EC tools
+│   ├── install.sh                             # One-click udev policy installer (--uninstall to remove)
+│   ├── 90-typec-mode-policy.rules             # Port altmode defaults + partner add/remove hooks
+│   ├── typec-mode-policy                      # Enters TBT3 if offered, else DP (mimics ChromeOS typecd)
+│   ├── build-ectool.sh                        # Builds standalone ChromiumOS ectool (R105, gcc only)
+│   └── comm-usb-stub.c                        # libusb stub so ectool builds without libusb-devel
 └── tools/                                     # Issue 1: ChromeOS EC & battery diagnostic tools
     ├── ectool.py                              # Direct /dev/cros_ec ioctl diagnostic utility
     ├── batt_logger.sh                         # Per-minute battery/EC CSV logger
