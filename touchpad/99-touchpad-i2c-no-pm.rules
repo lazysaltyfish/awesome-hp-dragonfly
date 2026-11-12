@@ -1,0 +1,10 @@
+# Keep touchpad (0000:00:19.1 -> i2c_designware.5 -> ELAN2703:00) and
+# touchscreen (0000:00:15.3 -> i2c_designware.3 -> ELAN2513:00) awake.
+# Both the LPSS PCI parent bridges AND their child DesignWare I2C platform
+# controllers must stay at power/control="on"; otherwise i2c_designware
+# autosuspends after 1000ms idle, causing initial-stroke hitching and
+# libinput "Touch jump detected and discarded" drops.
+ACTION=="add|bind|change", SUBSYSTEM=="pci", KERNEL=="0000:00:19.1", ATTR{power/control}="on"
+ACTION=="add|bind|change", SUBSYSTEM=="pci", KERNEL=="0000:00:15.3", ATTR{power/control}="on"
+ACTION=="add|bind|change", SUBSYSTEM=="platform", KERNEL=="i2c_designware.*", KERNELS=="0000:00:19.1", ATTR{power/control}="on"
+ACTION=="add|bind|change", SUBSYSTEM=="platform", KERNEL=="i2c_designware.*", KERNELS=="0000:00:15.3", ATTR{power/control}="on"

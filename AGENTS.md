@@ -125,6 +125,30 @@ sudo dracut -f
 
 ---
 
+### Step 7: Fix Touchpad / Cursor Frame Drops & Initial-Stroke Hitching (`i915` PSR2 + DesignWare I2C PM)
+
+- **Pre-check**:
+  ```bash
+  cat /proc/cmdline
+  for p in /sys/devices/pci0000:00/0000:00:19.1/i2c_designware.* /sys/devices/pci0000:00/0000:00:15.3/i2c_designware.*; do
+    [ -e "$p/power/control" ] && echo "$p: control=$(cat "$p/power/control") status=$(cat "$p/power/runtime_status")"
+  done
+  ```
+- **Apply**:
+  ```bash
+  ./touchpad/install.sh
+  # Optional power-saving fallback (PSR1 without broken PSR2 Selective Fetch):
+  # ./touchpad/install.sh --psr1
+  # Uninstall: ./touchpad/install.sh --uninstall
+  ```
+  *Note: The DesignWare I2C runtime PM fix takes effect immediately; a single reboot is required to activate `i915.enable_psr=0`.*
+- **Verify**:
+  - Both `/sys/devices/pci0000:00/0000:00:19.1/i2c_designware.*` (`ELAN2703:00` touchpad) and `/sys/devices/pci0000:00/0000:00:15.3/i2c_designware.*` (`ELAN2513:00` touchscreen) show `control=on` and `status=active` even after >2s idle.
+  - `/etc/kernel/cmdline` and `/etc/modprobe.d/i915-psr.conf` configure `i915.enable_psr=0` (`options i915 enable_psr=0`).
+  - After reboot: `cat /proc/cmdline` includes `i915.enable_psr=0`, and `journalctl -k -b 0 | grep "Selective fetch"` returns empty (no Pipe A selective fetch errors or `drmModeAtomicCommit: Device or resource busy` frame drops).
+
+---
+
 ## Workflow B: Diagnostics & Porting to Other Chromebooks
 
 If any verification above fails or you are diagnosing a different Chromebook board, refer to the detailed sections in `README.md`:
@@ -136,6 +160,7 @@ If any verification above fails or you are diagnosing a different Chromebook boa
 | **Camera Broken / Green** | IPU6 requires PipeWire camera flag + portal focus bug + missing `ov5675.yaml` BlackLevel/CCM | `README.md` **问题三 (§A–§F)** + `./camera/parse_aiqb.py` |
 | **Auto-Brightness Broken** | `gsd-power` relative normalization bug + GNOME 50 slider bias (`+0.5`) + linear PWM lacking $\gamma=2.2$ | `README.md` **问题四 (§A–§E)** |
 | **TBT3 Dock Not Detected** | Kernel `typec_displayport` auto-enters DP on attach (TBT3-only dock NAKs DP Configure, then NAKs TBT Enter/Exit); `cros_ec_typec` registers TBT port altmode `inactive` and nothing (no `typecd`) activates it | `README.md` **Issue 5 / 问题五** + `./thunderbolt/build-ectool.sh` (EC `console`) |
+| **Touchpad / Cursor Stutter** | `i915` PSR2 Selective Fetch fails on Alder Lake-P Pipe A (`drmModeAtomicCommit -EBUSY` drops) + locking only LPSS PCI parent (`00:19.1`) leaves child `i2c_designware.5` autosuspending after 1000ms (`libinput` touch jumps) | `README.md` **Issue 6 / 问题六** |
 
 ## Repository Layout
 
@@ -169,6 +194,10 @@ If any verification above fails or you are diagnosing a different Chromebook boa
 │   ├── typec-mode-policy
 │   ├── build-ectool.sh
 │   └── comm-usb-stub.c
+├── touchpad/                                  # Issue 6: i915 PSR disable & DesignWare I2C runtime PM fix
+│   ├── install.sh
+│   ├── 99-touchpad-i2c-no-pm.rules
+│   └── i915-psr.conf
 └── tools/                                     # Issue 1: ChromeOS EC & battery diagnostic tools
     ├── ectool.py
     ├── batt_logger.sh

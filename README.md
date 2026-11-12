@@ -34,7 +34,7 @@ Complete root-cause proofs, hardware/firmware disassembly findings, and one-clic
 | **Camera Stack** | OV5675 (MIPI CSI) → Intel IPU6 (`8086:465d`) → `libcamera` `0.7.2` (SoftISP) → PipeWire → Chrome Flatpak |
 | **Backlight & ALS** | BOE 2678 eDP (`intel_backlight`, raw PWM `0–96000`) + TI OPT3001 (`cros-ec-light` / `iio:device0`) |
 
-### Executive Summary (5 Independent Issues)
+### Executive Summary (6 Independent Issues)
 
 | # | Symptom | Root Cause | One-Line Fix |
 | :-: | :--- | :--- | :--- |
@@ -43,6 +43,7 @@ Complete root-cause proofs, hardware/firmware disassembly findings, and one-clic
 | **[3](#issue-3-flatpak-chrome-camera-broken--green-tint)** | Camera **unavailable in Flatpak Chrome**; once enabled, image has a **heavy green tint** | Chrome PipeWire camera flag disabled + `xdg-desktop-portal-gnome` focus bug blocks prompt + `libcamera` falls back to `uncalibrated.yaml` | `./camera/install.sh` + enable `chrome://flags/#enable-webrtc-pipewire-camera` |
 | **[4](#issue-4-erratic-auto-brightness--non-linear-slider)** | Auto-brightness **jumps erratically, stays blindingly bright in dark rooms, and pins GNOME slider at 100%** | `gsd-power` relative normalization bug + GNOME 50 slider acts as a fixed `+48.6%` bias + linear PWM lacks `γ = 2.2` perceptual curve + `EC_RATE=0` | `./brightness/install.sh` (udev 1Hz + logarithmic lux curve + `γ = 2.2` GNOME extension/daemon) |
 | **[5](#issue-5-thunderbolt-3-dock-not-detected)** | Thunderbolt 3 dock **only charges the laptop**: no Thunderbolt device, no USB, no disk, no DP | Kernel `typec_displayport` auto-enters DP alt mode on attach → TBT3-only dock NAKs DP Configure and gets stuck, then NAKs TBT Enter/Exit; `cros_ec_typec` registers the TBT port altmode `inactive` and nothing on Fedora (no ChromeOS `typecd`) activates it | `./thunderbolt/install.sh` (udev alt mode policy: TBT3 preferred, DP fallback) |
+| **[6](#issue-6-touchpad--cursor-frame-drops--initial-stroke-stutter)** | Touchpad cursor motion **feels choppy / drops frames (20–30fps-like)**, hitches after >1s idle, and occasionally skips | `i915` PSR2 Selective Fetch fails on Alder Lake-P Pipe A (`drmModeAtomicCommit -EBUSY` drops) + locking only LPSS PCI parent (`00:19.1`) leaves child `i2c_designware.5` autosuspending after 1000ms (`libinput` touch-jump discards) | `./touchpad/install.sh` (disables `i915` PSR + keeps LPSS & `i2c_designware` awake) |
 
 ### Quick Start (Apply All Fixes)
 
@@ -68,6 +69,9 @@ done
 
 # 5. Fix Thunderbolt 3 docks (Type-C alt mode policy: TBT3 > DP), then replug the dock
 ./thunderbolt/install.sh
+
+# 6. Fix touchpad & cursor frame drops (disable i915 PSR + keep DesignWare I2C awake; reboot once)
+./touchpad/install.sh
 ```
 
 ---
@@ -327,6 +331,40 @@ sudo ~/.cache/chromebook-fixes/ectool console            # PD state machine log 
 
 ---
 
+<a id="issue-6-touchpad--cursor-frame-drops--initial-stroke-stutter"></a>
+
+### Issue 6: Touchpad / Cursor Frame Drops & Initial-Stroke Stutter (`i915` PSR2 + `i2c_designware`)
+
+#### TL;DR
+- **Symptom**: Under GNOME Wayland, moving the pointer or scrolling gently on the built-in haptic touchpad (`ELAN2703:00 04F3:323B`) feels choppy with frequent frame drops (like 20–30 fps), hitches at the start of a stroke after >1 second of idle, and occasionally skips mid-swipe.
+- **Root Cause (Two Independent Layers)**:
+  1. **Display / Compositor Layer (Primary) — Broken `i915` PSR2 Selective Fetch on Alder Lake-P + BOE `0x0a76` eDP**: With default parameters (`enable_psr=-1`, `enable_psr2_sel_fetch=1`), every boot logs `i915 0000:00:02.0: [drm] Selective fetch area calculation failed in pipe A`. When the desktop is mostly static and only the hardware cursor plane (`Plane 145`, without `FB_DAMAGE_CLIPS`) or small scroll regions update, Pipe A repeatedly enters/exits PSR2 sleep and recalculates selective fetch bounding boxes, missing `16.67ms` VBlank deadlines and causing `gnome-shell` to drop frames with `Page flip failed: drmModeAtomicCommit: Device or resource busy` (25+ times per session on internal `eDP-1` alone). Because the BOE `2678` panel is physically `60.001 Hz`, dropping 1–2 frames halves instantaneous smoothness to 20–30 fps.
+  2. **Touchpad I2C Bus Layer (Secondary) — Locking Only the LPSS PCI Parent Leaves Child `i2c_designware.5` Autosuspending Every 1s**: Setting `ATTR{power/control}="on"` only on PCI parent `0000:00:19.1` (`intel-lpss`) leaves its child platform controller `i2c_designware.5` at `control=auto`, `autosuspend_delay_ms=1000` (measured `suspended` 85.9% of uptime; touchscreen `i2c_designware.3` 99.98%). Touching the pad after >1s idle asserts IRQ 100 while `i2c_designware.5` is clock-gated, causing initial-stroke lag and coalesced deltas that trigger `libinput error: event5 - ELAN2703:00 04F3:323B Touchpad: kernel bug: Touch jump detected and discarded.` (hitting the 5/24h log rate limit daily).
+- **Fix**:
+  ```bash
+  ./touchpad/install.sh
+  # Optional power-saving fallback (PSR1 without broken PSR2 Selective Fetch):
+  # ./touchpad/install.sh --psr1
+  # Uninstall: ./touchpad/install.sh --uninstall
+  ```
+  The DesignWare I2C runtime PM fix takes effect immediately; reboot once to activate `i915.enable_psr=0`.
+
+#### Excluded Hypotheses
+
+| Hypothesis | Evidence Ruling It Out |
+| :--- | :--- |
+| Missing `libinput` pressure thresholds (`AttrPressureRange`) dropping light touches | Inspected `/usr/share/libinput/50-system-google.quirks` and disassembled `libinput.so.10` (`1.32.0`): `[Google Chromebook Redrix]` is already built in, and `hid-haptic` marks `event5` with `INPUT_PROP_PRESSUREPAD` (`properties=0x85`), causing `libinput` to disable `ABS_MT_PRESSURE` threshold gating automatically via `libevdev_disable_event_code`. |
+| Static DRRS locking the panel to its `40.002 Hz` low-refresh EDID mode | Live `libdrm` (`drmWaitVBlank`) queries after 0.5s / 1.5s / 3.0s idle confirm VBlank remains steady at `16.667 ms` (`60.00 Hz`); frame drops come from PSR2 selective fetch wake/commit stalls rather than static 40 Hz throttling. |
+
+#### Files Installed (`./touchpad/`)
+
+| Path | Source | Purpose |
+| :--- | :--- | :--- |
+| `/etc/udev/rules.d/99-touchpad-i2c-no-pm.rules` | `touchpad/99-touchpad-i2c-no-pm.rules` | Sets `ATTR{power/control}="on"` on both LPSS PCI bridges (`0000:00:19.1`, `0000:00:15.3`) and their child `platform` `i2c_designware.*` controllers so neither touchpad nor touchscreen bus autosuspends after 1000ms. |
+| `/etc/modprobe.d/i915-psr.conf` + BLS `cmdline` | `touchpad/i915-psr.conf` + `grubby` | Configures `options i915 enable_psr=0` and updates `/etc/kernel/cmdline`, `/etc/default/grub`, and BLS boot entries via `grubby --update-kernel=ALL --args="i915.enable_psr=0"`. |
+
+---
+
 <a id="-中文完整文档"></a>
 
 ## 🇨🇳 中文完整文档
@@ -342,12 +380,12 @@ sudo ~/.cache/chromebook-fixes/ectool console            # PD state machine log 
 | **实测机型 / 主板** | HP Elite Dragonfly Chromebook（主板代号 `redrix`，Brya 家族，HWID `REDRIX-CLQY`） |
 | **处理器** | Intel Core i5-1245U（第 12 代 Alder Lake-P） |
 | **固件版本** | MrChromebox `2609.2` UEFI Full ROM · EC RW `redrix_v2.0.27867`（Nuvoton NPCX993F） |
-| **系统与桌面** | Fedora 44 Workstation（Kernel `7.2.11` / `7.2.13`）+ GNOME `50.6` |
+| **系统与桌面** | Fedora 44/45 Workstation（Kernel `7.2.11`–`7.2.15`）+ GNOME `50.6` / `51.1` |
 | **音频栈** | SOF 固件 `2.2.0`（`sof-adl-max98390-rt5682.tplg`）+ PipeWire `1.6.10` + WirePlumber `0.5.18` + `alsa-ucm` `1.2.16` |
 | **摄像头栈** | OV5675（MIPI CSI）→ Intel IPU6（`8086:465d`）→ `libcamera` `0.7.2`（SoftISP）→ PipeWire → Chrome Flatpak |
 | **背光与光线传感器** | BOE 2678 eDP 面板（`intel_backlight`，线性 PWM `0–96000`）+ TI OPT3001（`cros-ec-light` / `iio:device0`） |
 
-### 总览（五个独立问题与一键修复）
+### 总览（六个独立问题与一键修复）
 
 | # | 症状 | 根因 | 修复（一行命令） |
 | :-: | :--- | :--- | :--- |
@@ -356,6 +394,7 @@ sudo ~/.cache/chromebook-fixes/ectool console            # PD state machine log 
 | **[三](#问题三flatpak-chrome-摄像头不可用与画面偏绿)** | Flatpak Chrome **摄像头不可用**；打通后**画面明显偏绿** | Chrome PipeWire camera flag 未开 + portal 焦点检查 bug + 缺原厂 `ov5675.yaml` 调校 | `./camera/install.sh` + 开启 `chrome://flags/#enable-webrtc-pipewire-camera` |
 | **[四](#问题四自动屏幕亮度怪异与滑块拉满)** | 自动亮度**变化不线性、暗光下依然刺眼且右上角滑块拉满** | `gsd-power` 相对归一化缺陷 + GNOME 50 滑块固定偏移 `+48.6%` + 线性 PWM 缺 `γ = 2.2` 校正 + `EC_RATE=0` | `./brightness/install.sh`（udev 1Hz + 对数曲线 + `γ = 2.2` 扩展/服务） |
 | **[五](#问题五雷电-3-扩展坞无法识别)** | 雷电 3 扩展坞**只给电脑充电**：没有 Thunderbolt 设备，硬盘、DP、USB 都不出现 | 内核 `typec_displayport` 在插入时自动进入 DP 模式 → 只支持雷电 3 的扩展坞拒绝 DP 配置并卡住，之后连 TBT 的进入和退出请求也一并拒绝；`cros_ec_typec` 把 TBT 端口模式注册为 `inactive`，Fedora 上没有 ChromeOS 的 `typecd` 去开启它 | `./thunderbolt/install.sh`（udev 模式策略：优先 TBT3，没有再用 DP） |
+| **[六](#问题六触控板掉帧光标卡顿与起手粘滞)** | 触控板滑动**感觉明显掉帧（像 20–30fps）、停手 >1s 再滑起手发粘、偶发跳帧丢点** | `i915` PSR2 Selective Fetch 在 Pipe A 计算失败并频繁报 `drmModeAtomicCommit -EBUSY` 丢帧 + 仅锁 PCI 父桥未锁子设备 `i2c_designware.5`（闲置 1s 自动休眠引发 `Touch jump` 丢包） | `./touchpad/install.sh`（禁用 `i915` PSR + 保持 LPSS 与 `i2c_designware` 常驻唤醒） |
 
 ---
 
@@ -572,6 +611,33 @@ sudo ~/.cache/chromebook-fixes/ectool console            # PD 状态机日志（
 
 ---
 
+<a id="问题六触控板掉帧光标卡顿与起手粘滞"></a>
+
+### 问题六：触控板掉帧、光标卡顿与起手粘滞（`i915` PSR2 + `i2c_designware` 休眠）
+
+#### TL;DR
+- **现象**：在 GNOME Wayland 下使用内置触控板（`ELAN2703:00 04F3:323B`）移动光标或轻滑滚动时，长期感觉指针不跟手、像掉到 20–30fps 一样一卡一卡；手指停顿超过 1 秒再次滑动时起手发粘，且滑动中途偶发停顿漏帧。
+- **根因（两层独立问题叠加）**：
+  1. **显示合成层主因——`i915` PSR2 Selective Fetch 在 Alder Lake-P + 内置 BOE 面板（`0x0a76`）上异常**：`i915` 默认启用 `enable_psr=-1`（自动开启到 PSR2）与 `enable_psr2_sel_fetch=1`。每次开机内核必报 `i915 0000:00:02.0: [drm] Selective fetch area calculation failed in pipe A`。当桌面大体静止、仅硬件光标层（`Plane 145`，无 `FB_DAMAGE_CLIPS`）或小块区域更新时，Pipe A 频繁进出 PSR2 自刷新并重算局部抓取框，错过 `16.67ms` VBlank 窗口，导致 `gnome-shell` 大量报 `Page flip failed: drmModeAtomicCommit: Device or resource busy` 直接丢帧（内置屏物理刷新率上限为 `60.001Hz`，连丢 1–2 帧即跌至 20–30fps）。
+  2. **触控总线次因——仅锁住 LPSS PCI 父设备，子平台控制器 `i2c_designware.5` 仍在 1 秒自动休眠**：如果 udev 规则只对 PCI 父桥 `0000:00:19.1`（`intel-lpss`）设 `power/control="on"`，其子设备 `i2c_designware.5` 仍保持 `control=auto`、`autosuspend_delay_ms=1000`（实测 85.9% 的运行时间处于 `suspended`；触控屏 `i2c_designware.3` 更是 99.98% 挂起）。手指停顿 >1 秒再触碰时，`ELAN2703` 先拉低中断（IRQ 100），而 `i2c_designware.5` 需唤醒恢复时钟，引发起手延迟与首包积压，进而触发 `libinput` 每天刷满限流上限的 `kernel bug: Touch jump detected and discarded.`（坐标突变包被直接丢弃）。
+- **修复**：
+  ```bash
+  ./touchpad/install.sh
+  # 可选：若想保留基础 PSR1 省电、仅关闭出 Bug 的 PSR2 Selective Fetch：
+  # ./touchpad/install.sh --psr1
+  # 卸载恢复默认：./touchpad/install.sh --uninstall
+  ```
+  执行后 I2C 控制器常驻唤醒**立即生效**；重启一次使内核参数 `i915.enable_psr=0` 生效。
+
+#### 部署的文件（`./touchpad/`）
+
+| 系统路径 | 仓库来源 | 作用 |
+| :--- | :--- | :--- |
+| `/etc/udev/rules.d/99-touchpad-i2c-no-pm.rules` | `touchpad/99-touchpad-i2c-no-pm.rules` | 同时将 LPSS PCI 父桥（`0000:00:19.1`、`0000:00:15.3`）及其下属 `platform` 子设备 `i2c_designware.*` 设为 `ATTR{power/control}="on"`，彻底阻止 1 秒自动休眠。 |
+| `/etc/modprobe.d/i915-psr.conf` + BLS `cmdline` | `touchpad/i915-psr.conf` + `grubby` | 写入 `options i915 enable_psr=0` 并通过 `grubby --update-kernel=ALL --args="i915.enable_psr=0"` 同步更新 `/etc/kernel/cmdline`、`/etc/default/grub` 与 BLS 启动项。 |
+
+---
+
 ## Repository Structure / 仓库目录结构
 
 ```text
@@ -605,6 +671,10 @@ awesome-hp-dragonfly/
 │   ├── typec-mode-policy                      # Enters TBT3 if offered, else DP (mimics ChromeOS typecd)
 │   ├── build-ectool.sh                        # Builds standalone ChromiumOS ectool (R105, gcc only)
 │   └── comm-usb-stub.c                        # libusb stub so ectool builds without libusb-devel
+├── touchpad/                                  # Issue 6: i915 PSR disable & DesignWare I2C runtime PM fix
+│   ├── install.sh                             # One-click udev + grubby/modprobe installer (--psr1 / --uninstall)
+│   ├── 99-touchpad-i2c-no-pm.rules            # Keeps LPSS PCI bridges & child i2c_designware.* controllers awake
+│   └── i915-psr.conf                          # Disables broken PSR2 Selective Fetch (options i915 enable_psr=0)
 └── tools/                                     # Issue 1: ChromeOS EC & battery diagnostic tools
     ├── ectool.py                              # Direct /dev/cros_ec ioctl diagnostic utility
     ├── batt_logger.sh                         # Per-minute battery/EC CSV logger

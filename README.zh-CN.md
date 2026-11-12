@@ -1,7 +1,7 @@
 <div align="center">
 
 # HP Elite Dragonfly Chromebook (`redrix`) Linux 完整修复手册
-### 充电限流 · 音频麦克风 · IPU6 摄像头调校 · 自动亮度感知曲线 · 雷电 3 扩展坞
+### 充电限流 · 音频麦克风 · IPU6 摄像头调校 · 自动亮度感知曲线 · 雷电 3 扩展坞 · 触控板与显示防掉帧
 
 **[🇬🇧 English / Bilingual Overview (README.md)](./README.md) · [🤖 AI Agent 工作流 (AGENTS.md)](./AGENTS.md)**
 
@@ -15,15 +15,15 @@
 | :--- | :--- |
 | **适用范围** | 刷入 MrChromebox UEFI 固件或安装原生 Linux 的 ChromeOS 设备（特别是 Brya 家族） |
 | **实测机型** | HP Elite Dragonfly Chromebook（主板：`redrix`，Alder Lake i5-1245U，HWID：`REDRIX-CLQY`） |
-| **操作系统** | Fedora 44 Workstation（Kernel `7.2.11` / `7.2.13`）+ MrChromebox `2609.2` UEFI Full ROM |
-| **音频环境** | SOF 固件 `2.2.0` + PipeWire `1.6.10` + WirePlumber `0.5.18` + `alsa-ucm` `1.2.16` + GNOME `50.6` |
+| **操作系统** | Fedora 44/45 Workstation（Kernel `7.2.11`–`7.2.15`）+ MrChromebox `2609.2` UEFI Full ROM |
+| **音频环境** | SOF 固件 `2.2.0` + PipeWire `1.6.10` + WirePlumber `0.5.18` + `alsa-ucm` `1.2.16` + GNOME `50.6` / `51.1` |
 | **摄像头环境** | `libcamera` `0.7.2-2.fc44` + `pipewire-plugin-libcamera` + Google Chrome `156` Flatpak |
-| **自动亮度环境** | `gnome-shell` `50.6` + `gnome-settings-daemon` `50.1` + `iio-sensor-proxy` `3.8` + `cros-ec-light` (`TI OPT3001`) |
-| **实证日期** | 2026-10-27（问题一/二/三）、2026-11-01（问题四）、2026-11-07（问题五，Fedora 45 / Kernel `7.2.15`），全程在本机实证完成 |
+| **自动亮度环境** | `gnome-shell` `50.6` / `51.1` + `gnome-settings-daemon` `50.1` + `iio-sensor-proxy` `3.8` + `cros-ec-light` (`TI OPT3001`) |
+| **实证日期** | 2026-10-27（问题一/二/三）、2026-11-01（问题四）、2026-11-07（问题五）、2026-11-12（问题六，Fedora 45 / Kernel `7.2.15`），全程在本机实证完成 |
 
 ---
 
-## 总览（五个问题，各自独立）
+## 总览（六个问题，各自独立）
 
 | # | 症状 | 根因 | 修复（一行版） |
 | :-: | :--- | :--- | :--- |
@@ -32,6 +32,7 @@
 | **[三](#问题三flatpak-chrome-摄像头不可用与画面偏绿)** | Chrome 摄像头不可用；打通后偏绿 | flag 未开 + portal 弹窗 bug + 无原厂色彩调校 | `./camera/install.sh` + 开启 Chrome PipeWire camera flag |
 | **[四](#问题四自动屏幕亮度怪异与滑块拉满)** | 自动亮度变化不线性、暗光下过亮且滑块拉满 | `gsd-power` 相对归一化缺陷 + GNOME 50 滑块固定偏移 + 线性 PWM 未做 `γ = 2.2` 校正 + `EC_RATE=0` | `./brightness/install.sh`（udev + 对数曲线 + `γ = 2.2` 扩展/服务） |
 | **[五](#问题五雷电-3-扩展坞无法识别)** | 雷电 3 扩展坞只充电，硬盘、DP、USB 都不出现 | 内核自动进入 DP 模式，扩展坞拒绝后卡住，再也不接受 TBT；`cros_ec_typec` 的 TBT 模式默认未启用，又没有 `typecd` 去开启 | `./thunderbolt/install.sh`（udev 策略：优先 TBT3，没有再用 DP） |
+| **[六](#问题六触控板掉帧光标卡顿与起手粘滞)** | 触控板滑动感觉明显掉帧、起手粘滞、偶发跳帧丢点 | `i915` PSR2 Selective Fetch 在 Pipe A 计算失败并频繁触发 `drmModeAtomicCommit -EBUSY` 丢帧 + 仅锁定 PCI 父桥未锁子设备 `i2c_designware.5`（闲置 1s 自动休眠导致 `Touch jump` 丢包） | `./touchpad/install.sh`（禁用 `i915` PSR + 保持 LPSS 与 `i2c_designware` 常驻唤醒） |
 
 > **给 AI Agent 的提示**：如果你是负责在新系统上恢复配置或排查问题的 Agent，请优先阅读同目录下的 **[`AGENTS.md`](./AGENTS.md)** 获取结构化的幂等执行与验证工作流。
 
@@ -509,3 +510,49 @@ sudo ~/.cache/chromebook-fixes/ectool typecstatus 0      # EC 侧端口切换器
 sudo ~/.cache/chromebook-fixes/ectool console            # PD 状态机日志（NAK、重试）
 ```
 > 扩展坞已经卡在 DP 模式时，不要用 `ectool typeccontrol <port> 2 1` 强制进入 TBT，那会让 EC 进入无限重试循环。拔插一次，或者运行 `typeccontrol <port> 0`，就能停下来。
+
+---
+
+<a id="问题六触控板掉帧光标卡顿与起手粘滞"></a>
+
+## 问题六：触控板掉帧、光标卡顿与起手粘滞（`i915` PSR2 + `i2c_designware` 休眠）
+
+### TL;DR
+- **现象**：在 GNOME Wayland 下使用内置触控板（`ELAN2703:00 04F3:323B`）移动光标或小幅滚动页面时，长期感觉指针不跟手、像掉到 20–30fps 一样一卡一卡；手指停顿超过 1 秒再次滑动时起手发粘，且滑动中途偶发停顿漏帧。
+- **根因（两层独立问题叠加）**：
+  1. **显示合成层主因——`i915` PSR2 Selective Fetch 在 Alder Lake-P + 内置 BOE 面板（`0x0a76`）上异常**：`i915` 默认启用 `enable_psr=-1`（自动开启到 PSR2）与 `enable_psr2_sel_fetch=1`。每次开机内核必报 `i915 0000:00:02.0: [drm] Selective fetch area calculation failed in pipe A`。当桌面大体静止、仅硬件光标层（`Plane 145`，无 `FB_DAMAGE_CLIPS`）或小块区域更新时，Pipe A 频繁进出 PSR2 自刷新并重算局部抓取框，错过 `16.67ms` VBlank 窗口，导致 `gnome-shell` 大量报 `Page flip failed: drmModeAtomicCommit: Device or resource busy` 直接丢帧（内置屏物理刷新率上限为 `60.001Hz`，连丢 1–2 帧即跌至 20–30fps）。
+  2. **触控总线次因——仅锁住 LPSS PCI 父设备，子平台控制器 `i2c_designware.5` 仍在 1 秒自动休眠**：如果 udev 规则只对 PCI 父桥 `0000:00:19.1`（`intel-lpss`）设 `power/control="on"`，其子设备 `i2c_designware.5` 仍保持 `control=auto`、`autosuspend_delay_ms=1000`（实测 85.9% 的运行时间处于 `suspended`；触控屏 `i2c_designware.3` 更是 99.98% 挂起）。手指停顿 >1 秒再触碰时，`ELAN2703` 先拉低中断（IRQ 100），而 `i2c_designware.5` 需唤醒恢复时钟，引发起手延迟与首包积压，进而触发 `libinput` 每天刷满限流上限的 `kernel bug: Touch jump detected and discarded.`（坐标突变包被直接丢弃）。
+- **修复**：
+  ```bash
+  ./touchpad/install.sh
+  # 可选：若想保留基础 PSR1 省电、仅关闭出 Bug 的 PSR2 Selective Fetch：
+  # ./touchpad/install.sh --psr1
+  # 卸载恢复默认：./touchpad/install.sh --uninstall
+  ```
+  执行后 I2C 控制器常驻唤醒**立即生效**；重启一次使内核参数 `i915.enable_psr=0` 生效。
+
+### 排除过的干扰项（避免踩过时教程的坑）
+
+| 假说 | 实证与排除依据 |
+| :--- | :--- |
+| 缺少旧版 `libinput` 压感阈值（`AttrPressureRange`）导致断触 | 检查 `/usr/share/libinput/50-system-google.quirks` 并反汇编 `libinput.so.10` (`1.32.0`) 确认：`Redrix` 规则已内置，且内核 `hid-haptic` 已为 `event5` 标记 `INPUT_PROP_PRESSUREPAD`（`properties=0x85`），`libinput` 检测到 ForcePad/Haptic 属性后直接调用 `libevdev_disable_event_code` 禁用 `ABS_MT_PRESSURE` 门限判定，无需手动覆盖压感配置 |
+| 静态 DRRS 将屏幕锁死在 40Hz 低刷档 | 解码 `card1-eDP-1` EDID 确认面板含 `60.001Hz` 与 `40.002Hz` 两个 DTD；通过 `libdrm` (`drmWaitVBlank`) 实测静止 0.5s / 1.5s / 3.0s 后的硬件帧间隔均稳定在 `16.667ms` (`60.00Hz`)，卡顿完全来自 PSR2 唤醒丢帧而非静态降频 |
+
+### 部署的文件（`./touchpad/`）
+
+| 系统路径 | 仓库来源 | 作用 |
+| :--- | :--- | :--- |
+| `/etc/udev/rules.d/99-touchpad-i2c-no-pm.rules` | `touchpad/99-touchpad-i2c-no-pm.rules` | 同时将 LPSS PCI 父桥（`0000:00:19.1`、`0000:00:15.3`）及其下属 `platform` 子设备 `i2c_designware.*` 设为 `ATTR{power/control}="on"`，彻底阻止 1 秒自动休眠。 |
+| `/etc/modprobe.d/i915-psr.conf` + BLS `cmdline` | `touchpad/i915-psr.conf` + `grubby` | 写入 `options i915 enable_psr=0` 并通过 `grubby --update-kernel=ALL --args="i915.enable_psr=0"` 同步更新 `/etc/kernel/cmdline`、`/etc/default/grub` 与 BLS 启动项。 |
+
+### 验证方法
+```bash
+# 1. 确认 I2C 控制器常驻 active（闲置 >2 秒后仍为 control=on status=active）
+for p in /sys/devices/pci0000:00/0000:00:19.1/i2c_designware.* /sys/devices/pci0000:00/0000:00:15.3/i2c_designware.*; do
+  echo "$p: control=$(cat "$p/power/control") status=$(cat "$p/power/runtime_status")"
+done
+
+# 2. 重启后确认 PSR 已禁用且无 Selective fetch / Page flip 报错
+cat /proc/cmdline
+journalctl -b 0 | grep -E "Selective fetch|Page flip failed|Touch jump"
+```
